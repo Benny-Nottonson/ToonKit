@@ -10,7 +10,7 @@ Add ToonKit to your project via Swift Package Manager:
 
 ```swift
 // In Package.swift:
-.package(url: "https://github.com/your-org/ToonKit.git", from: "1.0.0")
+.package(url: "https://github.com/Benny-Nottonson/ToonKit.git", from: "1.0.0")
 ```
 
 Or in Xcode: **File → Add Packages…** and enter the repository URL.
