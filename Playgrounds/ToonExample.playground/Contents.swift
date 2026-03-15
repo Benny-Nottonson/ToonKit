@@ -5,12 +5,6 @@ import Toon
 
 print("=== Simple Struct ===\n")
 
-struct Config: Codable, Equatable {
-    let host: String
-    let port: Int
-    let debug: Bool
-}
-
 let config = Config(host: "api.example.com", port: 8080, debug: false)
 let encoder = ToonEncoder()
 
@@ -27,12 +21,6 @@ print("Round-trip ✓\n")
 
 print("=== Primitive Arrays ===\n")
 
-struct Tags: Codable {
-    let service: String
-    let tags: [String]
-    let ports: [Int]
-}
-
 let tagged = Tags(service: "nginx", tags: ["http", "proxy", "balancer"], ports: [80, 443])
 let tagData = try encoder.encode(tagged)
 print(String(data: tagData, encoding: .utf8)!)
@@ -40,17 +28,6 @@ print(String(data: tagData, encoding: .utf8)!)
 // MARK: - 3. Tabular Arrays (object arrays encoded as CSV-like)
 
 print("=== Tabular Arrays ===\n")
-
-struct Product: Codable {
-    let sku: String
-    let qty: Int
-    let price: Double
-}
-
-struct Cart: Codable {
-    let currency: String
-    let items: [Product]
-}
 
 let cart = Cart(
     currency: "USD",
@@ -71,19 +48,11 @@ print("Cart round-trip ✓ — \(decodedCart.items.count) items\n")
 
 print("=== Nested Objects ===\n")
 
-struct Address: Codable {
-    let street: String
-    let city: String
-    let country: String
-}
-
-struct User: Codable {
-    let id: Int
-    let name: String
-    let address: Address
-}
-
-let user = User(id: 42, name: "Ada Lovelace", address: Address(street: "1 Math Lane", city: "London", country: "GB"))
+let user = User(
+    id: 42,
+    name: "Ada Lovelace",
+    address: Address(street: "1 Math Lane", city: "London", country: "GB")
+)
 let userData = try encoder.encode(user)
 print(String(data: userData, encoding: .utf8)!)
 
@@ -117,18 +86,11 @@ print(String(data: tabData, encoding: .utf8)!)
 
 print("=== Foundation Types ===\n")
 
-struct Asset: Codable {
-    let name: String
-    let url: URL
-    let createdAt: Date
-    let thumbnail: Data
-}
-
 let asset = Asset(
     name: "logo.png",
     url: URL(string: "https://cdn.example.com/logo.png")!,
     createdAt: Date(timeIntervalSince1970: 1_700_000_000),
-    thumbnail: Data([0xFF, 0xD8, 0xFF, 0xE0])
+    thumbnail: Data([0xFF, 0xD8, 0xFF, 0xE0] as [UInt8])
 )
 
 let assetData = try encoder.encode(asset)
@@ -141,13 +103,9 @@ print("Asset round-trip ✓ — \(decodedAsset.name)\n")
 
 print("=== Non-Finite Float Strategies ===\n")
 
-struct Measurement: Codable {
-    let value: Double
-}
-
 let nullEncoder = ToonEncoder()
 nullEncoder.nonFiniteFloatStrategy = .null
-let nullStrategyData = try nullEncoder.encode(Measurement(value: .nan))
+let nullStrategyData = try nullEncoder.encode(ToonMeasurement(value: .nan))
 print("null strategy:", String(data: nullStrategyData, encoding: .utf8)!)
 
 let stringEncoder = ToonEncoder()
@@ -156,7 +114,7 @@ stringEncoder.nonFiniteFloatStrategy = .convertToString(
     negativeInfinity: "-Infinity",
     nan: "NaN"
 )
-let stringStrategyData = try stringEncoder.encode(Measurement(value: .infinity))
+let stringStrategyData = try stringEncoder.encode(ToonMeasurement(value: .infinity))
 print("string strategy:", String(data: stringStrategyData, encoding: .utf8)!)
 
 print("\nDone! 🎉")

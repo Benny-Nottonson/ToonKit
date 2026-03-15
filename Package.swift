@@ -29,8 +29,8 @@ let package = Package(
             name: "Toon",
             path: "Sources/Toon",
             resources: [
-                .copy("Internal/Metal/Shaders/ToonStringClassifyKernels.metal"),
-                .copy("Internal/Metal/Shaders/ToonStringEncodeKernels.metal"),
+                .process("Internal/Metal/Shaders/ToonStringClassifyKernels.metal"),
+                .process("Internal/Metal/Shaders/ToonStringEncodeKernels.metal"),
             ]
         ),
         .executableTarget(

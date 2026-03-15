@@ -86,7 +86,6 @@ struct ExchangeRateFeed: Codable {
     let rates: [ExchangeRateEntry]
 }
 
-@main
 struct ToonBenchmarkCommand {
     static func main() throws {
         let payload = BenchmarkPayload(
