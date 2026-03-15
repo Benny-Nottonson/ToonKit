@@ -96,8 +96,26 @@ enum ToonMetalTokenDecoder {
             var object: [String: ToonValue] = Dictionary(minimumCapacity: fieldCount)
             for field in fields {
                 guard cellIdx < metalValues.count else { return nil }
-                // nil means non-ASCII or unrecognised escape → fall back to CPU
-                guard let value = metalValues[cellIdx] else { return nil }
+                let value: ToonValue
+                if let acceleratedValue = metalValues[cellIdx] {
+                    value = acceleratedValue
+                } else {
+                    let start = Int(rangeStarts[cellIdx])
+                    let end = Int(rangeEnds[cellIdx])
+                    guard start >= 0,
+                          end >= start,
+                          end <= allBytes.count
+                    else { return nil }
+
+                    let parsedValue = allBytes.withUnsafeBufferPointer { buffer -> ToonValue? in
+                        let rawCell = UnsafeBufferPointer(rebasing: buffer[start..<end])
+                        return try? ToonPrimitiveParser.parsePrimitive(utf8: rawCell)
+                    }
+                    guard let parsedValue else {
+                        return nil
+                    }
+                    value = parsedValue
+                }
                 object[field] = value
                 cellIdx += 1
             }

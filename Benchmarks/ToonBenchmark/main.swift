@@ -127,10 +127,12 @@ struct ToonBenchmarkCommand {
         let encodedData = try withoutAccelerationEncoder.encode(payload)
         let encodedExchangeRateFeed = try withoutAccelerationEncoder.encode(exchangeRateFeed)
         let largeEscapedString = String(repeating: "value,with:\"quotes\"\\slashes\\nand\\ttabs|", count: 128)
+        let largeSafeASCIIString = String(repeating: "abcdefghijklmnopqrstuvwxyz0123456789", count: 256)
         let toonEncodedEscapedStringData = try withoutAccelerationEncoder.encode(largeEscapedString)
         let jsonEncodedEscapedStringData = try jsonEncoder.encode(largeEscapedString)
+        let toonEncodedSafeStringData = try withoutAccelerationEncoder.encode(largeSafeASCIIString)
+        let jsonEncodedSafeStringData = try jsonEncoder.encode(largeSafeASCIIString)
         let largeEscapedStringArray = Array(repeating: largeEscapedString, count: 2_048)
-        let largeSafeASCIIString = String(repeating: "abcdefghijklmnopqrstuvwxyz0123456789", count: 256)
         let largeSafeASCIIStringArray = Array(repeating: largeSafeASCIIString, count: 2_048)
 
         _ = try withDynamicAccelerationEncoder.encode(largeEscapedStringArray)
@@ -140,7 +142,9 @@ struct ToonBenchmarkCommand {
         _ = try withDynamicAccelerationEncoder.encode(exchangeRateFeed)
         _ = try withForcedAccelerationEncoder.encode(exchangeRateFeed)
         _ = try decoder.decode(String.self, from: toonEncodedEscapedStringData)
+        _ = try decoder.decode(String.self, from: toonEncodedSafeStringData)
         _ = try jsonDecoder.decode(String.self, from: jsonEncodedEscapedStringData)
+        _ = try jsonDecoder.decode(String.self, from: jsonEncodedSafeStringData)
 
         print("Toon Benchmark")
         print("=============")
@@ -300,6 +304,19 @@ struct ToonBenchmarkCommand {
                 },
                 secondOperation: {
                     _ = try jsonDecoder.decode(String.self, from: jsonEncodedEscapedStringData)
+                }
+            )
+
+            try runHeadToHeadComparison(
+                name: "Decode large safe ASCII string",
+                firstLabel: "ToonDecoder",
+                secondLabel: "JSONDecoder",
+                iterations: benchmarkMode == "all" ? 80_000 : 20_000,
+                firstOperation: {
+                    _ = try decoder.decode(String.self, from: toonEncodedSafeStringData)
+                },
+                secondOperation: {
+                    _ = try jsonDecoder.decode(String.self, from: jsonEncodedSafeStringData)
                 }
             )
         }
