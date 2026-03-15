@@ -2,12 +2,6 @@ import Foundation
 import Dispatch
 
 enum ToonStringLiteralEncoder {
-    private static let metalMinimumStringCount = 16
-    private static let metalMinimumAverageStringBytes = 96
-    private static let metalMinimumTotalBytes = 65_536
-    private static let parallelFallbackMinimumStringCount = 512
-    private static let parallelFallbackMinimumTotalBytes = 262_144
-
     static var isMetalAccelerationAvailable: Bool {
         ToonMetalStringAccelerator.shared.isAvailable
     }
@@ -35,74 +29,61 @@ enum ToonStringLiteralEncoder {
         let deduplicatedBatch = deduplicateBatchIfBeneficial(stringValues)
         let candidateStringValues = deduplicatedBatch.uniqueValues
         let hasDeduplicatedMapping = deduplicatedBatch.originalToUniqueIndices != nil
+        let estimatedTotalBytes = candidateStringValues.reduce(into: 0) { $0 += $1.utf8.count }
 
-        func encodeDeduplicatedOnCPU() -> [String] {
+        func encodeDeduplicatedOnCPUOnSingleThread() -> [String] {
             let encodedUniqueValues = candidateStringValues.map {
                 encode($0, delimiter: delimiter, acceleration: .disabled)
             }
             return deduplicatedBatch.expand(encodedUniqueValues: encodedUniqueValues)
         }
 
-        let minimumStringByteCount: Int
-        let usesAdaptiveGate: Bool
-        let isForcedMetal: Bool
+        func fallback() -> [String]? {
+            if let encodedCandidates = encodeBatchInParallelOnCPUIfBeneficial(
+                candidateStringValues,
+                delimiter: delimiter,
+                estimatedTotalBytes: estimatedTotalBytes
+            ) {
+                return deduplicatedBatch.expand(encodedUniqueValues: encodedCandidates)
+            }
 
-        switch acceleration {
-        case .disabled:
+            if hasDeduplicatedMapping {
+                return encodeDeduplicatedOnCPUOnSingleThread()
+            }
+
             return nil
-        case .metal(let configuredMinimumStringByteCount):
-            minimumStringByteCount = configuredMinimumStringByteCount
-            usesAdaptiveGate = true
-            isForcedMetal = false
-        case .metalForced(let configuredMinimumStringByteCount):
-            minimumStringByteCount = configuredMinimumStringByteCount
-            usesAdaptiveGate = false
-            isForcedMetal = true
+        }
+
+        guard let request = ToonStringAccelerationPolicy.request(for: acceleration) else {
+            return nil
         }
 
         guard let delimiterByte = delimiter.utf8.first else {
             return nil
         }
 
-        let estimatedTotalBytes = candidateStringValues.reduce(into: 0) { $0 += $1.utf8.count }
-        let requiredTotalBytes = max(minimumStringByteCount, metalMinimumTotalBytes)
-
-        if !isForcedMetal {
-            guard candidateStringValues.count >= metalMinimumStringCount,
-                  estimatedTotalBytes >= requiredTotalBytes
-            else {
-                if hasDeduplicatedMapping {
-                    return encodeDeduplicatedOnCPU()
-                }
-                return nil
-            }
+        guard ToonStringAccelerationPolicy.canAttemptMetalBeforeASCIIScan(
+            candidateCount: candidateStringValues.count,
+            estimatedTotalBytes: estimatedTotalBytes,
+            request: request
+        ) else {
+            return fallback()
         }
 
-        if usesAdaptiveGate,
+        if request.usesAdaptiveGate,
            !ToonMetalSpeedGate.shared.shouldUseMetal(
-                minimumStringByteCount: minimumStringByteCount,
-                     delimiter: delimiterByte,
-                     stringCount: candidateStringValues.count,
-                     estimatedTotalBytes: estimatedTotalBytes,
-                     averageStringBytes: candidateStringValues.isEmpty ? 0 : (estimatedTotalBytes / candidateStringValues.count)
+                minimumStringByteCount: request.minimumStringByteCount,
+                delimiter: delimiterByte,
+                stringCount: candidateStringValues.count,
+                estimatedTotalBytes: estimatedTotalBytes,
+                averageStringBytes: candidateStringValues.isEmpty ? 0 : (estimatedTotalBytes / candidateStringValues.count)
            )
         {
-            guard let encodedCandidates = encodeBatchInParallelOnCPUIfBeneficial(
-                candidateStringValues,
-                delimiter: delimiter,
-                estimatedTotalBytes: estimatedTotalBytes
-            ) else {
-                if hasDeduplicatedMapping {
-                    return encodeDeduplicatedOnCPU()
-                }
-                return nil
-            }
-
-            return deduplicatedBatch.expand(encodedUniqueValues: encodedCandidates)
+            return fallback()
         }
 
         var asciiRanges: [ToonASCIIStringRange] = []
-        asciiRanges.reserveCapacity(stringValues.count)
+        asciiRanges.reserveCapacity(candidateStringValues.count)
 
         var concatenatedBytes: [UInt8] = []
         concatenatedBytes.reserveCapacity(stringValues.reduce(into: 0) { $0 += $1.utf8.count })
@@ -148,28 +129,13 @@ enum ToonStringLiteralEncoder {
             }
         }
 
-                let averageStringBytes = asciiRanges.isEmpty ? 0 : (totalASCIIBytes / asciiRanges.count)
-
-                if isForcedMetal {
-                    guard !asciiRanges.isEmpty,
-                          totalASCIIBytes >= minimumStringByteCount
-                    else {
-                        return nil
-                    }
-                } else {
-                    guard asciiRanges.count > 1,
-                          asciiRanges.count >= metalMinimumStringCount,
-                          averageStringBytes >= metalMinimumAverageStringBytes,
-                          totalASCIIBytes >= minimumStringByteCount,
-                          totalASCIIBytes >= requiredTotalBytes
-                    else {
-                        return encodeBatchInParallelOnCPUIfBeneficial(
-                            stringValues,
-                            delimiter: delimiter,
-                            estimatedTotalBytes: estimatedTotalBytes
-                        )
-                    }
-                }
+        guard ToonStringAccelerationPolicy.canAttemptMetalAfterASCIIScan(
+            asciiStringCount: asciiRanges.count,
+            totalASCIIBytes: totalASCIIBytes,
+            request: request
+        ) else {
+            return request.isForcedMetal ? nil : fallback()
+        }
 
         guard let encodedASCIIValues = ToonMetalStringAccelerator.shared.encodeASCIIStringLiterals(
                 concatenatedBytes: concatenatedBytes,
@@ -178,36 +144,23 @@ enum ToonStringLiteralEncoder {
                 delimiter: delimiterByte
               )
         else {
-                    if isForcedMetal {
-                        return nil
-                    }
-            guard let encodedCandidates = encodeBatchInParallelOnCPUIfBeneficial(
-                candidateStringValues,
-                delimiter: delimiter,
-                estimatedTotalBytes: estimatedTotalBytes
-            ) else {
-                if hasDeduplicatedMapping {
-                    return encodeDeduplicatedOnCPU()
-                }
-                return nil
-            }
-            return deduplicatedBatch.expand(encodedUniqueValues: encodedCandidates)
+            return request.isForcedMetal ? nil : fallback()
         }
 
-                var encodedUniqueValues = Array(repeating: "", count: candidateStringValues.count)
-                var encodedByAccelerator = Array(repeating: false, count: candidateStringValues.count)
+        var encodedUniqueValues = Array(repeating: "", count: candidateStringValues.count)
+        var encodedByAccelerator = Array(repeating: false, count: candidateStringValues.count)
 
         for (range, encodedValue) in zip(asciiRanges, encodedASCIIValues) {
             encodedUniqueValues[range.originalIndex] = encodedValue
-                    encodedByAccelerator[range.originalIndex] = true
-                }
+            encodedByAccelerator[range.originalIndex] = true
+        }
 
-                for (index, stringValue) in candidateStringValues.enumerated() where !encodedByAccelerator[index] {
-                    encodedUniqueValues[index] = encode(
-                        stringValue,
-                        delimiter: delimiter,
-                        acceleration: .disabled
-                    )
+        for (index, stringValue) in candidateStringValues.enumerated() where !encodedByAccelerator[index] {
+            encodedUniqueValues[index] = encode(
+                stringValue,
+                delimiter: delimiter,
+                acceleration: .disabled
+            )
         }
 
         return deduplicatedBatch.expand(encodedUniqueValues: encodedUniqueValues)
@@ -272,8 +225,10 @@ enum ToonStringLiteralEncoder {
         delimiter: String,
         estimatedTotalBytes: Int
     ) -> [String]? {
-        guard stringValues.count >= parallelFallbackMinimumStringCount,
-              estimatedTotalBytes >= parallelFallbackMinimumTotalBytes
+        guard ToonStringAccelerationPolicy.shouldAttemptParallelCPU(
+            stringCount: stringValues.count,
+            estimatedTotalBytes: estimatedTotalBytes
+        )
         else {
             return nil
         }
@@ -303,121 +258,5 @@ enum ToonStringLiteralEncoder {
         }
 
         return encodedValues
-    }
-}
-
-private final class ToonMetalSpeedGate {
-    static let shared = ToonMetalSpeedGate()
-
-    var isEnabled: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return cachedBenchmarkDecision == true
-    }
-
-    private let lock = NSLock()
-    private var cachedBenchmarkDecision: Bool?
-    private var cachedMinimumStringByteCount = 0
-    private var cachedDelimiter: UInt8 = 0
-
-    private init() {}
-
-    func shouldUseMetal(
-        minimumStringByteCount: Int,
-        delimiter: UInt8,
-        stringCount: Int,
-        estimatedTotalBytes: Int,
-        averageStringBytes: Int
-    ) -> Bool {
-        guard ToonMetalStringAccelerator.shared.isAvailable else { return false }
-
-        if estimatedTotalBytes >= 1_048_576 {
-            return true
-        }
-
-        if stringCount >= 256,
-           estimatedTotalBytes >= 262_144,
-           averageStringBytes >= 64
-        {
-            return true
-        }
-
-        if stringCount < 192 || estimatedTotalBytes < 131_072 {
-            return false
-        }
-
-        lock.lock()
-        if let cachedBenchmarkDecision,
-           minimumStringByteCount == cachedMinimumStringByteCount,
-           delimiter == cachedDelimiter
-        {
-            lock.unlock()
-            return cachedBenchmarkDecision
-        }
-        lock.unlock()
-
-        let decision = benchmark(minimumStringByteCount: minimumStringByteCount, delimiter: delimiter)
-
-        lock.lock()
-        cachedBenchmarkDecision = decision
-        cachedMinimumStringByteCount = minimumStringByteCount
-        cachedDelimiter = delimiter
-        lock.unlock()
-
-        return decision
-    }
-
-    private func benchmark(minimumStringByteCount: Int, delimiter: UInt8) -> Bool {
-        guard ToonMetalStringAccelerator.shared.isAvailable else { return false }
-
-        let longEscapedBase = String(repeating: "value,with:\"quotes\"\\slashes\\nand\\ttabs|", count: 1_024)
-        let longEscapedBatch = (0..<256).map { "\(longEscapedBase)\($0)" }
-
-        let shortStructuredBatch = (0..<8_192).map {
-            "code_\($0)_market_spot_session_close_rate_ref"
-        }
-
-        let iterations = 3
-        let clock = ContinuousClock()
-
-        func measureSpeedup(sampleBatch: [String]) -> Double {
-            let totalSampleBytes = sampleBatch.reduce(into: 0) { $0 += $1.utf8.count }
-            guard totalSampleBytes >= minimumStringByteCount else { return 0 }
-
-            let cpuDuration = clock.measure {
-                for _ in 0..<iterations {
-                    _ = sampleBatch.map {
-                        ToonStringLiteralEncoder.encode(
-                            $0,
-                            delimiter: String(decoding: [delimiter], as: UTF8.self),
-                            acceleration: .disabled
-                        )
-                    }
-                }
-            }
-
-            let metalDuration = clock.measure {
-                for _ in 0..<iterations {
-                    _ = ToonStringLiteralEncoder.encodeBatch(
-                        sampleBatch,
-                        delimiter: String(decoding: [delimiter], as: UTF8.self),
-                        acceleration: .metalForced(minimumStringByteCount: minimumStringByteCount)
-                    )
-                }
-            }
-
-            let cpuAttoseconds = Double(cpuDuration.components.seconds) * 1_000_000_000_000_000_000
-                + Double(cpuDuration.components.attoseconds)
-            let metalAttoseconds = Double(metalDuration.components.seconds) * 1_000_000_000_000_000_000
-                + Double(metalDuration.components.attoseconds)
-
-            guard metalAttoseconds > 0 else { return 0 }
-            return cpuAttoseconds / metalAttoseconds
-        }
-
-        let longEscapedSpeedup = measureSpeedup(sampleBatch: longEscapedBatch)
-        let shortStructuredSpeedup = measureSpeedup(sampleBatch: shortStructuredBatch)
-
-        return max(longEscapedSpeedup, shortStructuredSpeedup) >= 1.15
     }
 }

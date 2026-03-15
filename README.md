@@ -238,6 +238,22 @@ Sources/Toon/
     └── Codable/
 ```
 
+### Internal Metal Modules (Encoding)
+
+- `MetalStringLiteralEncoder.swift`: orchestration layer for batch string encoding.
+- `MetalStringAccelerationPolicy.swift`: acceleration heuristics and threshold policy.
+- `MetalStringSpeedGate.swift`: adaptive runtime benchmark gate for dynamic mode.
+- `MetalStringAccelerator.swift`: Metal pipeline setup and kernel dispatch.
+- `MetalStringAnalyzer.swift`: CPU-side ASCII flag interpretation fallback.
+- `Shared/StringLiteralRules.swift`: shared literal classification/escaping rules used by CPU and Metal paths.
+
+### Internal Shader Modules
+
+- `Shaders/ToonStringShaderCommon.metal`: shared flag constants and helper routines.
+- `Shaders/ToonStringClassifyPrimaryKernel.metal`: primary character-classification kernel.
+- `Shaders/ToonStringClassifyAlternativeKernel.metal`: alternative classification kernel for large inputs.
+- `Shaders/ToonStringEncodeRangesKernel.metal`: range-based string encoding kernel.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

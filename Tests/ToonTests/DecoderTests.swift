@@ -142,6 +142,70 @@ struct DecoderTests {
         #expect(bag.items == [Item(sku: "A1", qty: 2), Item(sku: "B2", qty: 1)])
     }
 
+    @Test("Forced Metal decoding preserves escaped tabular string values")
+    func metalTabularDecodeEscapes() throws {
+        struct Row: Codable, Equatable {
+            let code: String
+            let note: String
+            let amount: Double
+            let active: Bool
+        }
+
+        struct Payload: Codable, Equatable {
+            let rows: [Row]
+        }
+
+        let rows = (0..<192).map { index in
+            Row(
+                code: "item_\(index)",
+                note: "quoted \"value\" \\ path \n line \t tab \(index)",
+                amount: Double(index) * 1.25,
+                active: index.isMultiple(of: 2)
+            )
+        }
+
+        let payload = Payload(rows: rows)
+        let encoder = ToonEncoder()
+        let data = try encoder.encode(payload)
+
+        let acceleratedDecoder = ToonDecoder()
+        acceleratedDecoder.acceleration = .metalForced
+
+        let decoded = try acceleratedDecoder.decode(Payload.self, from: data)
+        #expect(decoded == payload)
+    }
+
+    @Test("Forced Metal decoding falls back cleanly for non-ASCII tabular values")
+    func metalTabularDecodeFallbacksForUnicode() throws {
+        struct Row: Codable, Equatable {
+            let code: String
+            let city: String
+            let active: Bool
+        }
+
+        struct Payload: Codable, Equatable {
+            let rows: [Row]
+        }
+
+        let rows = (0..<192).map { index in
+            Row(
+                code: "row_\(index)",
+                city: index == 73 ? "Montréal" : "London_\(index)",
+                active: !index.isMultiple(of: 3)
+            )
+        }
+
+        let payload = Payload(rows: rows)
+        let encoder = ToonEncoder()
+        let data = try encoder.encode(payload)
+
+        let acceleratedDecoder = ToonDecoder()
+        acceleratedDecoder.acceleration = .metalForced
+
+        let decoded = try acceleratedDecoder.decode(Payload.self, from: data)
+        #expect(decoded == payload)
+    }
+
     @Test("Array of arrays decodes correctly")
     func arrayOfArrays() throws {
         struct Matrix: Decodable { let rows: [[Int]] }

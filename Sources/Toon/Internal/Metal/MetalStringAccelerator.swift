@@ -33,6 +33,11 @@ final class ToonMetalStringAccelerator {
     private var bufferCapacity = 0
     private var rangeBufferCapacity = 0
     private var encodedStringBufferCapacity = 0
+    // Decode-specific Metal buffers (reuse encode buffers for I/O; access serialised by lock).
+    private let decodeTokensPipelineState: MTLComputePipelineState?
+    private let decodeTokensThreadgroupWidth: Int
+    private var decodeOutputKindBuffer: MTLBuffer?
+    private var decodeOutputKindBufferCapacity = 0
 #endif
 
     private init() {
@@ -47,9 +52,11 @@ final class ToonMetalStringAccelerator {
            let encodeRangesFunction = library.makeFunction(name: "encode_ascii_string_ranges"),
            let classifyFunction = library.makeFunction(name: "classify_ascii_string_characters"),
            let classifyAlternativeFunction = library.makeFunction(name: "classify_ascii_string_characters_alternative"),
+           let decodeFunction = library.makeFunction(name: "decode_token_ranges"),
            let encodeRangesState = try? metalDevice.makeComputePipelineState(function: encodeRangesFunction),
            let classifyState = try? metalDevice.makeComputePipelineState(function: classifyFunction),
-           let classifyAlternativeState = try? metalDevice.makeComputePipelineState(function: classifyAlternativeFunction)
+           let classifyAlternativeState = try? metalDevice.makeComputePipelineState(function: classifyAlternativeFunction),
+           let decodeState = try? metalDevice.makeComputePipelineState(function: decodeFunction)
         {
             encodeRangesPipelineState = encodeRangesState
             encodeRangesThreadgroupWidth = max(
@@ -63,6 +70,11 @@ final class ToonMetalStringAccelerator {
                 classifyAlternativeState.threadExecutionWidth,
                 min(classifyAlternativeState.maxTotalThreadsPerThreadgroup, 256)
             )
+            decodeTokensPipelineState = decodeState
+            decodeTokensThreadgroupWidth = max(
+                decodeState.threadExecutionWidth,
+                min(decodeState.maxTotalThreadsPerThreadgroup, 128)
+            )
             isAvailable = commandQueue != nil
         } else {
             encodeRangesPipelineState = nil
@@ -71,6 +83,8 @@ final class ToonMetalStringAccelerator {
             classifyAlternativePipelineState = nil
             classifyThreadgroupWidth = 0
             classifyAlternativeThreadgroupWidth = 0
+            decodeTokensPipelineState = nil
+            decodeTokensThreadgroupWidth = 0
             isAvailable = false
         }
 #else
@@ -293,6 +307,184 @@ final class ToonMetalStringAccelerator {
 #endif
     }
 
+
+    // MARK: - Metal Decode
+
+    /// Classifies and optionally unescapes a batch of token ranges in parallel on the GPU.
+    ///
+    /// - Returns: One `ToonValue?` per token range; an inner `nil` means the token contains
+    ///   non-ASCII bytes and requires CPU handling.
+    ///   The outer return is `nil` on Metal failure or unrecoverable input error.
+    func decodeTokenRanges(
+        concatenatedBytes: [UInt8],
+        rangeStarts: [UInt32],
+        rangeEnds: [UInt32]
+    ) -> [ToonValue?]? {
+#if canImport(Metal)
+        guard let device,
+              let commandQueue,
+              let decodeTokensPipelineState,
+              !rangeStarts.isEmpty,
+              rangeStarts.count == rangeEnds.count
+        else { return nil }
+
+        let tokenCount = rangeStarts.count
+        let byteCount  = concatenatedBytes.count
+        guard byteCount > 0 else { return nil }
+
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard prepareBuffers(device: device, minimumCapacity: byteCount),
+              let inputBuffer
+        else { return nil }
+
+        concatenatedBytes.withUnsafeBytes { ptr in
+            memcpy(inputBuffer.contents(), ptr.baseAddress!, byteCount)
+        }
+
+        ensureScratchCapacity(rangeCount: tokenCount)
+
+        var totalOutputCapacity = 0
+        for i in 0..<tokenCount {
+            rangeStartsScratch[i] = rangeStarts[i]
+            rangeEndsScratch[i]   = rangeEnds[i]
+            let tokenLen = max(Int(rangeEnds[i]) - Int(rangeStarts[i]), 0)
+            guard totalOutputCapacity <= Int(UInt32.max) - tokenLen else { return nil }
+            rangeOffsetsScratch[i] = UInt32(totalOutputCapacity)
+            totalOutputCapacity += tokenLen
+        }
+
+        guard prepareRangeBuffers(
+            device: device,
+            minimumRangeCount: tokenCount,
+            minimumEncodedByteCount: max(totalOutputCapacity, 1)
+        ),
+              let rangeStartBuffer,
+              let rangeEndBuffer,
+              let rangeOffsetBuffer,
+              let outputLengthBuffer,
+              let encodedStringBuffer
+        else { return nil }
+
+        if tokenCount > decodeOutputKindBufferCapacity {
+            decodeOutputKindBuffer = device.makeBuffer(length: tokenCount, options: .storageModeShared)
+            decodeOutputKindBufferCapacity = tokenCount
+        }
+        guard let decodeOutputKindBuffer else { return nil }
+
+        let u32Stride = MemoryLayout<UInt32>.size
+        rangeStartsScratch.withUnsafeBytes { ptr in
+            memcpy(rangeStartBuffer.contents(), ptr.baseAddress!, tokenCount * u32Stride)
+        }
+        rangeEndsScratch.withUnsafeBytes { ptr in
+            memcpy(rangeEndBuffer.contents(), ptr.baseAddress!, tokenCount * u32Stride)
+        }
+        rangeOffsetsScratch.withUnsafeBytes { ptr in
+            memcpy(rangeOffsetBuffer.contents(), ptr.baseAddress!, tokenCount * u32Stride)
+        }
+
+        guard let commandBuffer = commandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder()
+        else { return nil }
+
+        encoder.setComputePipelineState(decodeTokensPipelineState)
+        encoder.setBuffer(inputBuffer,            offset: 0, index: 0)
+        encoder.setBuffer(rangeStartBuffer,       offset: 0, index: 1)
+        encoder.setBuffer(rangeEndBuffer,         offset: 0, index: 2)
+        encoder.setBuffer(rangeOffsetBuffer,      offset: 0, index: 3)
+        encoder.setBuffer(encodedStringBuffer,    offset: 0, index: 4)
+        encoder.setBuffer(outputLengthBuffer,     offset: 0, index: 5)
+        encoder.setBuffer(decodeOutputKindBuffer, offset: 0, index: 6)
+
+        let gridSize      = MTLSize(width: tokenCount, height: 1, depth: 1)
+        let threadgroupSz = MTLSize(
+            width: min(max(decodeTokensThreadgroupWidth, 1), tokenCount),
+            height: 1, depth: 1
+        )
+        encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSz)
+        encoder.endEncoding()
+
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        guard commandBuffer.status == .completed else { return nil }
+
+        let kindPtr   = decodeOutputKindBuffer.contents()
+            .bindMemory(to: UInt8.self,  capacity: tokenCount)
+        let lengthPtr = outputLengthBuffer.contents()
+            .bindMemory(to: UInt32.self, capacity: tokenCount)
+        let outRawPtr = encodedStringBuffer.contents()
+            .bindMemory(to: UInt8.self,  capacity: max(totalOutputCapacity, 1))
+        let inRawPtr  = inputBuffer.contents()
+            .bindMemory(to: UInt8.self,  capacity: byteCount)
+
+        var results: [ToonValue?] = []
+        results.reserveCapacity(tokenCount)
+
+        for i in 0..<tokenCount {
+            let kind      = kindPtr[i]
+            let rStart    = Int(rangeStarts[i])
+            let rEnd      = Int(rangeEnds[i])
+            let outOffset = Int(rangeOffsetsScratch[i])
+            let outLen    = Int(lengthPtr[i])
+
+            switch kind {
+            case 0: // null
+                results.append(.null)
+            case 1: // bool true
+                results.append(.bool(true))
+            case 2: // bool false
+                results.append(.bool(false))
+            case 3: // unquoted string — use original bytes
+                let count = max(rEnd - rStart, 0)
+                results.append(.string(
+                    String(decoding: UnsafeBufferPointer(start: inRawPtr + rStart, count: count),
+                           as: UTF8.self)
+                ))
+            case 4: // quoted no-escape — inner bytes (strip surrounding quotes)
+                let innerStart = rStart + 1
+                let innerEnd   = max(rEnd - 1, innerStart)
+                let count = innerEnd - innerStart
+                results.append(.string(
+                    String(decoding: UnsafeBufferPointer(start: inRawPtr + innerStart, count: count),
+                           as: UTF8.self)
+                ))
+            case 5: // quoted with escape — unescaped content in output buffer
+                guard outLen >= 0,
+                      outOffset >= 0,
+                      outOffset + outLen <= totalOutputCapacity
+                else { return nil }
+                results.append(.string(
+                    String(decoding: UnsafeBufferPointer(start: outRawPtr + outOffset, count: outLen),
+                           as: UTF8.self)
+                ))
+            case 6: // integer — parse raw bytes on CPU
+                let count = max(rEnd - rStart, 0)
+                let str = String(decoding: UnsafeBufferPointer(start: inRawPtr + rStart, count: count),
+                                 as: UTF8.self)
+                guard let intVal = Int64(str) else { return nil }
+                results.append(.int(intVal))
+            case 7: // double — parse raw bytes on CPU
+                let count = max(rEnd - rStart, 0)
+                let str = String(decoding: UnsafeBufferPointer(start: inRawPtr + rStart, count: count),
+                                 as: UTF8.self)
+                guard let dblVal = Double(str),
+                      str.contains(".") || str.contains("e") || str.contains("E")
+                else { return nil }
+                results.append(.double(dblVal))
+            case 8: // non-ASCII — signal CPU fallback for this specific token
+                results.append(nil)
+            default: // 255 = invalid escape sequence — abort entire batch
+                return nil
+            }
+        }
+        return results
+#else
+        _ = concatenatedBytes; _ = rangeStarts; _ = rangeEnds
+        return nil
+#endif
+    }
+
     private func classify(bytes: [UInt8], delimiter: UInt8) -> UnsafeBufferPointer<UInt8>? {
 #if canImport(Metal)
         guard let device,
@@ -410,8 +602,11 @@ final class ToonMetalStringAccelerator {
 
     private static func loadCombinedMetalSource() -> String? {
         let shaderFilenames = [
-            "ToonStringClassifyKernels",
-            "ToonStringEncodeKernels",
+            "ToonStringShaderCommon",
+            "ToonStringClassifyPrimaryKernel",
+            "ToonStringClassifyAlternativeKernel",
+            "ToonStringEncodeRangesKernel",
+            "ToonDecodeTokensKernel",
         ]
 
         var sources: [String] = []

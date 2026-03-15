@@ -21,16 +21,23 @@ final class ToonParser {
 
     let expandPaths: ToonDecoder.PathExpansion
     let limits: ToonDecoder.Limits
+    let acceleration: ToonDecoder.Acceleration
 
     // MARK: Init
 
-    init(text: String, expandPaths: ToonDecoder.PathExpansion, limits: ToonDecoder.Limits) {
+    init(
+        text: String,
+        expandPaths: ToonDecoder.PathExpansion,
+        limits: ToonDecoder.Limits,
+        acceleration: ToonDecoder.Acceleration
+    ) {
         lines = text
             .replacingOccurrences(of: "\r\n", with: "\n")
             .split(separator: "\n", omittingEmptySubsequences: false)
             .map(String.init)
         self.expandPaths = expandPaths
         self.limits = limits
+        self.acceleration = acceleration
     }
 
     // MARK: Entry Point
@@ -319,6 +326,51 @@ final class ToonParser {
     ///
     /// - Throws: ``ToonDecodingError/invalidEscapeSequence(_:)`` for unrecognised sequences.
     func unescapeString(_ str: String) throws -> String {
+        if !str.contains("\\") {
+            return str
+        }
+
+        if let fastPathResult = str.utf8.withContiguousStorageIfAvailable({ bytes -> Result<String, ToonDecodingError>? in
+            guard bytes.allSatisfy({ $0 < 128 }) else {
+                return nil
+            }
+
+            var result: [UInt8] = []
+            result.reserveCapacity(bytes.count)
+
+            var index = bytes.startIndex
+            while index < bytes.endIndex {
+                let byte = bytes[index]
+                if byte != 92 {
+                    result.append(byte)
+                    index = bytes.index(after: index)
+                    continue
+                }
+
+                index = bytes.index(after: index)
+                guard index < bytes.endIndex else {
+                    return .failure(.invalidEscapeSequence("Trailing backslash"))
+                }
+
+                switch bytes[index] {
+                case 92: result.append(92)
+                case 34: result.append(34)
+                case 110: result.append(10)
+                case 114: result.append(13)
+                case 116: result.append(9)
+                default:
+                    let invalid = String(decoding: [92, bytes[index]], as: UTF8.self)
+                    return .failure(.invalidEscapeSequence(invalid))
+                }
+
+                index = bytes.index(after: index)
+            }
+
+            return .success(String(decoding: result, as: UTF8.self))
+        }) ?? nil {
+            return try fastPathResult.get()
+        }
+
         var result = ""
         var escaped = false
         for character in str {

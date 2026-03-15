@@ -17,25 +17,7 @@ extension String {
         escapedBytes.reserveCapacity(utf8Bytes.count + utf8Bytes.count / 8)
 
         for byte in utf8Bytes {
-            switch byte {
-            case 92:
-                escapedBytes.append(92)
-                escapedBytes.append(92)
-            case 34:
-                escapedBytes.append(92)
-                escapedBytes.append(34)
-            case 10:
-                escapedBytes.append(92)
-                escapedBytes.append(110)
-            case 13:
-                escapedBytes.append(92)
-                escapedBytes.append(114)
-            case 9:
-                escapedBytes.append(92)
-                escapedBytes.append(116)
-            default:
-                escapedBytes.append(byte)
-            }
+            ToonStringLiteralRules.appendEscapedByte(byte, to: &escapedBytes)
         }
 
         return String(decoding: escapedBytes, as: UTF8.self)

@@ -159,8 +159,9 @@ extension ToonParser {
         delimiter: String,
         atDepth depth: Int
     ) throws -> [ToonValue] {
-        var rows: [ToonValue] = []
         let expectedDepth = depth + 1
+        var rowContents: [Substring] = []
+        rowContents.reserveCapacity(count)
 
         for _ in 0 ..< count {
             skipEmptyLines()
@@ -175,16 +176,37 @@ extension ToonParser {
                     message: "Expected depth \(expectedDepth), got \(lineDepth)"
                 )
             }
-            let cellValues = try parseDelimitedValues(String(content), delimiter: delimiter)
+            rowContents.append(content)
+        }
+
+        if let decodedRows = ToonMetalTokenDecoder.decodeTabular(
+            rowContents: rowContents,
+            fields: fields,
+            delimiter: delimiter,
+            acceleration: acceleration
+        ) {
+            return decodedRows
+        }
+
+        var rows: [ToonValue] = []
+        rows.reserveCapacity(rowContents.count)
+        for (rowIndex, rowContent) in rowContents.enumerated() {
+            let cellValues = try parseDelimitedValues(String(rowContent), delimiter: delimiter)
             guard cellValues.count == fields.count else {
                 throw ToonDecodingError.fieldCountMismatch(
-                    expected: fields.count, actual: cellValues.count, line: currentLine
+                    expected: fields.count,
+                    actual: cellValues.count,
+                    line: (currentLine - rowContents.count + rowIndex + 1)
                 )
             }
             var objectValues: [String: ToonValue] = [:]
-            for (field, cellValue) in zip(fields, cellValues) { objectValues[field] = cellValue }
+            objectValues.reserveCapacity(fields.count)
+            for (field, cellValue) in zip(fields, cellValues) {
+                objectValues[field] = cellValue
+            }
             rows.append(.object(objectValues, keyOrder: fields))
         }
+
         return rows
     }
 
